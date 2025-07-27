@@ -423,3 +423,54 @@ export(
 )
 
 export(PACKAGE TritonPythonBackend)
+
+#
+# Test binary for deserialize function equivalence (simple version)
+#
+add_executable(
+  test-deserialize-equivalence
+  src/test_deserialize_simple.cpp
+)
+
+add_dependencies(test-deserialize-equivalence boostorg)
+
+target_compile_features(test-deserialize-equivalence PRIVATE cxx_std_${TRITON_MIN_CXX_STANDARD})
+target_compile_options(
+  test-deserialize-equivalence PRIVATE
+  $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>,$<CXX_COMPILER_ID:GNU>>:
+    -Wall -Wextra -Wno-unused-parameter -Wno-type-limits>
+  $<$<CXX_COMPILER_ID:MSVC>:/Wall /D_WIN32_WINNT=0x0A00 /EHsc /Zc:preprocessor>
+)
+target_compile_definitions(test-deserialize-equivalence PRIVATE TRITON_PB_STUB)
+
+# Set up proper include paths
+target_include_directories(
+  test-deserialize-equivalence
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_BINARY_DIR}
+  ${boostorg_INCLUDE_DIRS}
+)
+
+if(WIN32)
+  target_link_libraries(
+    test-deserialize-equivalence
+    PRIVATE
+    pybind11::embed
+  )
+else()
+  target_link_libraries(
+    test-deserialize-equivalence
+    PRIVATE
+    pybind11::embed
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+  )
+endif()
+
+# Copy Python utils to build directory for easy access
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/resources/triton_python_backend_utils.py
+  ${CMAKE_CURRENT_BINARY_DIR}/triton_python_backend_utils.py
+  COPYONLY
+)

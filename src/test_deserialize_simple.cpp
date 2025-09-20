@@ -37,6 +37,7 @@
 #include <pybind11/numpy.h>
 
 namespace py = pybind11;
+using namespace pybind11::literals;
 
 // Include the exception class
 class PythonBackendException : public std::exception {
@@ -224,6 +225,188 @@ bool compare_arrays(const py::array& cpp_result, const py::array& python_result,
     return true;
 }
 
+// Focused benchmark for struct.unpack_from operation
+void benchmark_struct_unpack_operations() {
+    std::cout << "\n\n=== PERFORMANCE BENCHMARK: struct.unpack_from vs C++ ===" << std::endl;
+    std::cout << "=========================================================" << std::endl;
+
+    // Test different string sizes
+    std::vector<size_t> test_sizes = {10, 100, 1000, 10000, 100000};
+
+    for (size_t string_size : test_sizes) {
+        std::cout << "\nTesting single string of size: " << string_size << " bytes" << std::endl;
+
+        // Create test data - single string with length prefix
+        std::vector<uint8_t> test_data;
+
+        // Add 4-byte length prefix (little-endian)
+        uint32_t length = static_cast<uint32_t>(string_size);
+        test_data.push_back(length & 0xFF);
+        test_data.push_back((length >> 8) & 0xFF);
+        test_data.push_back((length >> 16) & 0xFF);
+        test_data.push_back((length >> 24) & 0xFF);
+
+        // Add string data
+        for (size_t i = 0; i < string_size; i++) {
+            test_data.push_back('A' + (i % 26));
+        }
+
+        py::bytes py_data = py::bytes(reinterpret_cast<const char*>(test_data.data()), test_data.size());
+
+        // Measure multiple iterations for stability
+        const int iterations = 10000;
+
+        // Benchmark Python struct.unpack_from for the exact line 117 operation
+        {
+            std::cout << "  Testing: sb = struct.unpack_from(\"<{}s\".format(l), val_buf, offset)[0]" << std::endl;
+
+            // Setup Python code that mimics the exact operation
+            py::exec(R"(
+import struct
+def single_unpack_string(val_buf, l, offset):
+    # This is the exact operation from line 117
+    sb = struct.unpack_from("<{}s".format(l), val_buf, offset)[0]
+    return sb
+            )");
+
+            py::object py_func = py::globals()["single_unpack_string"];
+
+            // Warm up
+            for (int i = 0; i < 100; i++) {
+                py::bytes result = py_func(py_data, length, 4);
+            }
+
+            // Measure Python version
+            auto py_start = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                py::bytes result = py_func(py_data, length, 4);
+            }
+            auto py_end = std::chrono::high_resolution_clock::now();
+
+            // Measure C++ equivalent
+            auto cpp_start = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                // Create py::bytes object - more comparable to struct.unpack_from
+                py::bytes bytes_obj(reinterpret_cast<const char*>(test_data.data() + 4), length);
+            }
+            auto cpp_end = std::chrono::high_resolution_clock::now();
+
+            auto py_time = std::chrono::duration_cast<std::chrono::nanoseconds>(py_end - py_start);
+            auto cpp_time = std::chrono::duration_cast<std::chrono::nanoseconds>(cpp_end - cpp_start);
+
+            double py_per_call = static_cast<double>(py_time.count()) / iterations;
+            double cpp_per_call = static_cast<double>(cpp_time.count()) / iterations;
+
+            std::cout << "    Python struct.unpack_from: " << py_per_call << " ns per call" << std::endl;
+            std::cout << "    C++ direct access:         " << cpp_per_call << " ns per call" << std::endl;
+            std::cout << "    Overhead per call:         " << (py_per_call - cpp_per_call) << " ns" << std::endl;
+            std::cout << "    Speedup:                   " << std::fixed << std::setprecision(2)
+                     << py_per_call / cpp_per_call << "x" << std::endl;
+        }
+
+        // Also test just the length unpacking (line 115)
+        {
+            std::cout << "\n  Testing: l = struct.unpack_from(\"<I\", val_buf, offset)[0]" << std::endl;
+
+            py::exec(R"(
+import struct
+def single_unpack_length(val_buf, offset):
+    # This is from line 115
+    l = struct.unpack_from("<I", val_buf, offset)[0]
+    return l
+            )");
+
+            py::object py_func = py::globals()["single_unpack_length"];
+
+            // Warm up
+            for (int i = 0; i < 100; i++) {
+                py::int_ result = py_func(py_data, 0);
+            }
+
+            // Measure Python version
+            auto py_start = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                py::int_ result = py_func(py_data, 0);
+            }
+            auto py_end = std::chrono::high_resolution_clock::now();
+
+            // Measure C++ equivalent
+            auto cpp_start = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                volatile uint32_t result = *reinterpret_cast<const uint32_t*>(test_data.data());
+                (void)result; // Prevent optimization
+            }
+            auto cpp_end = std::chrono::high_resolution_clock::now();
+
+            auto py_time = std::chrono::duration_cast<std::chrono::nanoseconds>(py_end - py_start);
+            auto cpp_time = std::chrono::duration_cast<std::chrono::nanoseconds>(cpp_end - cpp_start);
+
+            double py_per_call = static_cast<double>(py_time.count()) / iterations;
+            double cpp_per_call = static_cast<double>(cpp_time.count()) / iterations;
+
+            std::cout << "    Python struct.unpack_from: " << py_per_call << " ns per call" << std::endl;
+            std::cout << "    C++ direct access:         " << cpp_per_call << " ns per call" << std::endl;
+            std::cout << "    Overhead per call:         " << (py_per_call - cpp_per_call) << " ns" << std::endl;
+            std::cout << "    Speedup:                   " << std::fixed << std::setprecision(2)
+                     << py_per_call / cpp_per_call << "x" << std::endl;
+        }
+    }
+
+    // Test with a realistic workload
+    std::cout << "\n\nRealistic Workload Test (15000 strings)" << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    size_t num_strings = 15000;
+    std::vector<std::string> test_strings;
+    test_strings.reserve(num_strings);
+    for (size_t i = 0; i < num_strings; i++) {
+        test_strings.push_back("string_" + std::to_string(i));
+    }
+
+    std::vector<uint8_t> serialized = serialize_strings(test_strings);
+    py::bytes py_serialized = py::bytes(reinterpret_cast<const char*>(serialized.data()), serialized.size());
+
+    py::module triton_pb_utils = py::module::import("triton_python_backend_utils");
+
+    // Full function comparison
+    const int iterations = 100;
+
+    // Warm up
+    for (int i = 0; i < 5; i++) {
+        py::array py_result = triton_pb_utils.attr("deserialize_bytes_tensor")(py_serialized);
+        py::array cpp_result = deserialize_bytes_tensor_cpp(serialized.data(), serialized.size());
+    }
+
+    // Python version
+    auto py_start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; i++) {
+        py::array py_result = triton_pb_utils.attr("deserialize_bytes_tensor")(py_serialized);
+    }
+    auto py_end = std::chrono::high_resolution_clock::now();
+
+    // C++ version
+    auto cpp_start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; i++) {
+        py::array cpp_result = deserialize_bytes_tensor_cpp(serialized.data(), serialized.size());
+    }
+    auto cpp_end = std::chrono::high_resolution_clock::now();
+
+    auto py_time = std::chrono::duration_cast<std::chrono::microseconds>(py_end - py_start);
+    auto cpp_time = std::chrono::duration_cast<std::chrono::microseconds>(cpp_end - cpp_start);
+
+    std::cout << "  Python deserialize_bytes_tensor: " << py_time.count() / iterations << " μs per call" << std::endl;
+    std::cout << "  C++ deserialize_bytes_tensor:    " << cpp_time.count() / iterations << " μs per call" << std::endl;
+    std::cout << "  Speedup:                          " << std::fixed << std::setprecision(2)
+             << static_cast<double>(py_time.count()) / cpp_time.count() << "x" << std::endl;
+
+    // Calculate estimated impact of struct.unpack_from
+    double estimated_unpack_overhead = num_strings * 2 * 500; // ~500ns per unpack call (estimate from above)
+    std::cout << "\n  Estimated struct.unpack_from overhead: ~" << estimated_unpack_overhead / 1000 << " μs" << std::endl;
+    std::cout << "  Actual performance difference:         " << (py_time.count() - cpp_time.count()) / iterations << " μs" << std::endl;
+
+    std::cout << "\n=== END OF PERFORMANCE BENCHMARK ===" << std::endl;
+}
+
 int main() {
     std::cout << "Simple Deserialize Function Equivalence Test" << std::endl;
     std::cout << "=============================================" << std::endl;
@@ -366,13 +549,16 @@ int main() {
     std::cout << "Passed: " << passed << std::endl;
     std::cout << "Failed: " << failed << std::endl;
     std::cout << "Total time: " << total_time.count() << "ms" << std::endl;
-    std::cout << "Success rate: " << std::fixed << std::setprecision(1) 
+    std::cout << "Success rate: " << std::fixed << std::setprecision(1)
               << (static_cast<double>(passed) / test_cases.size() * 100) << "%" << std::endl;
-    
+
     if (passed > 0) {
         std::cout << "\nAll functional equivalence tests passed!" << std::endl;
         std::cout << "The C++ and Python implementations produce identical results." << std::endl;
     }
-    
+
+    // Run the performance benchmark
+    benchmark_struct_unpack_operations();
+
     return failed > 0 ? 1 : 0;
 }

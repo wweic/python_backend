@@ -41,6 +41,9 @@ namespace py = pybind11;
 
 #include <functional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
 
 #include "pb_memory.h"
 #include "pb_string.h"
@@ -179,6 +182,13 @@ class PbTensor {
   /// \throw If the tensor is stored in GPU, an exception is thrown
   /// \return NumPy representation of the Tensor
   const py::array* AsNumpy() const;
+
+  /// Get zero-copy Arrow-compatible (offsets, data) buffers for a BYTES tensor.
+  /// Returns a tuple (int32 offsets[N+1], uint8 data[total_bytes]) as NumPy
+  /// views over internally-owned compacted buffers (built once, then cached).
+  /// Lets the Python side build a pa.StringArray without materializing N PyBytes
+  /// objects or doing per-element decode/lookup in the interpreter.
+  py::object AsStringBuffers();
 #endif
 
   /// Save tensor inside shared memory.
@@ -233,11 +243,25 @@ class PbTensor {
   ~PbTensor() noexcept(false);
 
  private:
+#ifdef TRITON_PB_STUB
+  // Lazily build numpy_array_ from shared memory on first AsNumpy() call. For
+  // numeric CPU tensors this yields a zero-copy view over shm; for BYTES it does
+  // the PyBytes deserialization. Deferring lets zero-copy consumers (to_dlpack,
+  // as_string_buffers) skip the copy entirely.
+  void EnsureNumpyMaterialized() const;
+#endif
+
   std::string name_;
 #ifdef TRITON_PB_STUB
-  py::array numpy_array_;
+  mutable py::array numpy_array_;
   // Storing the serialized version of the numpy array
   py::array numpy_array_serialized_;
+  // False when loaded from shm and numpy_array_ has not yet been built.
+  mutable bool numpy_materialized_ = true;
+  // Compacted (offsets,data) buffers backing zero-copy Arrow string access.
+  mutable std::vector<int32_t> str_offsets_;
+  mutable std::vector<uint8_t> str_data_;
+  mutable bool str_buffers_built_ = false;
 #endif
   TRITONSERVER_DataType dtype_;
   void* memory_ptr_;
@@ -257,4 +281,28 @@ class PbTensor {
   // The pointer is null when the object is not stored in shared memory.
   std::unique_ptr<PbMemory> pb_memory_;
 };
+
+#ifdef TRITON_PB_STUB
+// Persistent string->int64 lookup table. The hash table is built ONCE (e.g. in
+// TritonPythonModel.initialize) and reused across every execute() call, which is
+// what pyarrow's pc.index_in cannot do (it rebuilds the value_set hash on every
+// call). lookup() reads a BYTES tensor's length-prefixed shared-memory blob
+// directly -- no PyBytes objects, no per-call rehash, no compaction copy -- and
+// returns an int64 NumPy array of mapped ids (default_value for misses).
+class StringLookupTable {
+ public:
+  StringLookupTable(
+      const std::vector<std::string>& keys,
+      const std::vector<int64_t>& values, int64_t default_value);
+  // Look up every string in a BYTES/STRING PbTensor. Returns int64 NumPy[N].
+  py::array LookupTensor(const std::shared_ptr<PbTensor>& tensor);
+
+ private:
+  // Owns a single contiguous copy of all key bytes; map keys are string_views
+  // into this blob (stable because capacity is reserved up front).
+  std::string key_blob_;
+  std::unordered_map<std::string_view, int64_t> map_;
+  int64_t default_value_;
+};
+#endif  // TRITON_PB_STUB
 }}}  // namespace triton::backend::python

@@ -460,6 +460,9 @@ Stub::StubSetup()
   py::setattr(
       python_backend_utils, "Tensor", c_python_backend_utils.attr("Tensor"));
   py::setattr(
+      python_backend_utils, "StringLookupTable",
+      c_python_backend_utils.attr("StringLookupTable"));
+  py::setattr(
       python_backend_utils, "InferenceRequest",
       c_python_backend_utils.attr("InferenceRequest"));
   py::setattr(
@@ -551,6 +554,9 @@ Stub::Initialize(bi::managed_external_buffer::handle_t map_handle)
       c_python_backend_utils.attr("TritonModelException"));
   py::setattr(
       python_backend_utils, "Tensor", c_python_backend_utils.attr("Tensor"));
+  py::setattr(
+      python_backend_utils, "StringLookupTable",
+      c_python_backend_utils.attr("StringLookupTable"));
   py::setattr(
       python_backend_utils, "InferenceRequest",
       c_python_backend_utils.attr("InferenceRequest"));
@@ -1893,6 +1899,12 @@ PYBIND11_EMBEDDED_MODULE(c_python_backend_utils, module)
       .def(
           "as_numpy", &PbTensor::AsNumpy,
           py::return_value_policy::reference_internal)
+      // Zero-copy (offsets, data) buffers for BYTES tensors. reference_internal
+      // keeps the tensor (and its shared memory) alive while the returned NumPy
+      // views are referenced.
+      .def(
+          "as_string_buffers", &PbTensor::AsStringBuffers,
+          py::return_value_policy::reference_internal)
       .def("triton_dtype", &PbTensor::TritonDtype)
       .def("to_dlpack", &PbTensor::ToDLPack)
       .def("is_cpu", &PbTensor::IsCPU)
@@ -1900,6 +1912,18 @@ PYBIND11_EMBEDDED_MODULE(c_python_backend_utils, module)
       .def("from_dlpack", &PbTensor::FromDLPack)
       .def("__dlpack__", &PbTensor::DLPack, py::arg("stream") = py::none())
       .def("__dlpack_device__", &PbTensor::DLPackDevice);
+
+  // Persistent C++ string->int64 lookup table (hash built once, reused every
+  // call) -- the correct replacement for pc.index_in, which rehashes its
+  // value_set on every invocation.
+  py::class_<StringLookupTable, std::shared_ptr<StringLookupTable>>(
+      module, "StringLookupTable")
+      .def(
+          py::init<
+              const std::vector<std::string>&, const std::vector<int64_t>&,
+              int64_t>(),
+          py::arg("keys"), py::arg("values"), py::arg("default_value") = -1)
+      .def("lookup", &StringLookupTable::LookupTensor);
 
   py::class_<InferResponse, std::shared_ptr<InferResponse>>(
       module, "InferenceResponse")

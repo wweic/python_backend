@@ -577,6 +577,37 @@ PbTensor::Name() const
 }
 
 #ifdef TRITON_PB_STUB
+void
+PbTensor::EnsureNumpyMaterialized() const
+{
+  if (numpy_materialized_) {
+    return;
+  }
+  if (memory_type_ == TRITONSERVER_MEMORY_CPU ||
+      memory_type_ == TRITONSERVER_MEMORY_CPU_PINNED) {
+    if (dtype_ == TRITONSERVER_TYPE_BF16) {
+      // No native numpy representation for BF16. DLPack should be used instead.
+      numpy_array_ = py::none();
+    } else if (dtype_ != TRITONSERVER_TYPE_BYTES) {
+      // Zero-copy: wrap the shared-memory buffer in a NumPy array with a
+      // non-owning base capsule, so no data is copied. The PbTensor object
+      // keeps the shared memory alive for as long as the NumPy array is
+      // referenced (see reference_internal on the "as_numpy" binding).
+      py::capsule base((void*)memory_ptr_, [](void*) {});
+      py::object numpy_array = py::array(
+          triton_to_pybind_dtype(dtype_), dims_, (void*)memory_ptr_, base);
+      numpy_array_ = numpy_array.attr("view")(triton_to_numpy_type(dtype_));
+    } else {
+      py::object numpy_array = deserialize_bytes_tensor_cpp(
+          static_cast<const uint8_t*>(memory_ptr_), byte_size_);
+      numpy_array_ = numpy_array.attr("reshape")(dims_);
+    }
+  } else {
+    numpy_array_ = py::none();
+  }
+  numpy_materialized_ = true;
+}
+
 const py::array*
 PbTensor::AsNumpy() const
 {
@@ -591,7 +622,69 @@ PbTensor::AsNumpy() const
         "to_dlpack() and from_dlpack() instead.");
   }
 
+  EnsureNumpyMaterialized();
   return &numpy_array_;
+}
+
+py::object
+PbTensor::AsStringBuffers()
+{
+  if (dtype_ != TRITONSERVER_TYPE_BYTES) {
+    throw PythonBackendException(
+        "as_string_buffers() is only valid for BYTES/STRING tensors.");
+  }
+  if (!IsCPU()) {
+    throw PythonBackendException(
+        "as_string_buffers() is only valid for CPU tensors.");
+  }
+
+  if (!str_buffers_built_) {
+    // The shm blob is length-prefixed: repeated [uint32 len | len bytes].
+    // Compact the string bodies into a contiguous data buffer and build an
+    // int32 offsets array so the Python side can wrap them in a zero-copy
+    // pa.StringArray. This replaces N PyBytes allocations + per-element decode
+    // with a single bulk memcpy + vectorized Arrow kernels downstream.
+    const uint8_t* data = static_cast<const uint8_t*>(memory_ptr_);
+    const size_t data_size = byte_size_;
+    size_t offset = 0, num = 0, total = 0;
+    while (offset + 4 <= data_size) {
+      uint32_t len = *reinterpret_cast<const uint32_t*>(data + offset);
+      offset += 4;
+      if (offset + len > data_size) {
+        throw PythonBackendException(
+            "Invalid bytes tensor data: string extends beyond buffer");
+      }
+      num++;
+      total += len;
+      offset += len;
+    }
+    str_offsets_.resize(num + 1);
+    str_data_.resize(total);
+    offset = 0;
+    size_t di = 0;
+    str_offsets_[0] = 0;
+    for (size_t i = 0; i < num; i++) {
+      uint32_t len = *reinterpret_cast<const uint32_t*>(data + offset);
+      offset += 4;
+      std::memcpy(str_data_.data() + di, data + offset, len);
+      di += len;
+      offset += len;
+      str_offsets_[i + 1] = static_cast<int32_t>(di);
+    }
+    str_buffers_built_ = true;
+  }
+
+  // Zero-copy NumPy views over the internally-owned compacted buffers. The
+  // PbTensor owns the vectors and outlives the views (reference_internal).
+  py::capsule off_base(str_offsets_.data(), [](void*) {});
+  py::capsule dat_base(str_data_.data(), [](void*) {});
+  std::vector<py::ssize_t> off_shape{static_cast<py::ssize_t>(str_offsets_.size())};
+  std::vector<py::ssize_t> dat_shape{static_cast<py::ssize_t>(str_data_.size())};
+  py::array offs(
+      py::dtype::of<int32_t>(), off_shape, str_offsets_.data(), off_base);
+  py::array dat(
+      py::dtype::of<uint8_t>(), dat_shape, str_data_.data(), dat_base);
+  return py::make_tuple(offs, dat);
 }
 #endif  // TRITON_PB_STUB
 
@@ -715,23 +808,82 @@ PbTensor::PbTensor(
   shm_handle_ = tensor_shm_.handle_;
 
 #ifdef TRITON_PB_STUB
-  if (memory_type_ == TRITONSERVER_MEMORY_CPU ||
-      memory_type_ == TRITONSERVER_MEMORY_CPU_PINNED) {
-    if (dtype_ == TRITONSERVER_TYPE_BF16) {
-      // No native numpy representation for BF16. DLPack should be used instead.
-      numpy_array_ = py::none();
-    } else if (dtype_ != TRITONSERVER_TYPE_BYTES) {
-      py::object numpy_array =
-          py::array(triton_to_pybind_dtype(dtype_), dims_, (void*)memory_ptr_);
-      numpy_array_ = numpy_array.attr("view")(triton_to_numpy_type(dtype_));
-    } else {
-      py::object numpy_array = deserialize_bytes_tensor_cpp(
-          static_cast<const uint8_t*>(memory_ptr_), byte_size_);
-      numpy_array_ = numpy_array.attr("reshape")(dims_);
-    }
-  } else {
-    numpy_array_ = py::none();
-  }
+  // Defer NumPy materialization until first AsNumpy(). The model may instead
+  // consume the data zero-copy via to_dlpack() (numeric) or as_string_buffers()
+  // (BYTES), avoiding the shm->NumPy copy / N x PyBytes deserialization here in
+  // the hot LoadRequestsFromSharedMemory path.
+  numpy_array_ = py::none();
+  numpy_materialized_ = false;
 #endif
 }
+
+#ifdef TRITON_PB_STUB
+StringLookupTable::StringLookupTable(
+    const std::vector<std::string>& keys,
+    const std::vector<int64_t>& values, int64_t default_value)
+    : default_value_(default_value)
+{
+  if (keys.size() != values.size()) {
+    throw PythonBackendException(
+        "StringLookupTable: keys and values must have the same length.");
+  }
+  // Reserve the blob up front so appends never reallocate; string_views into it
+  // then stay valid for the lifetime of the table.
+  size_t total = 0;
+  for (const auto& k : keys) {
+    total += k.size();
+  }
+  key_blob_.reserve(total);
+  map_.reserve(keys.size() * 2);
+  for (size_t i = 0; i < keys.size(); i++) {
+    size_t off = key_blob_.size();
+    key_blob_.append(keys[i]);
+    std::string_view sv(key_blob_.data() + off, keys[i].size());
+    map_[sv] = values[i];
+  }
+}
+
+py::array
+StringLookupTable::LookupTensor(const std::shared_ptr<PbTensor>& tensor)
+{
+  if (tensor->TritonDtype() != TRITONSERVER_TYPE_BYTES) {
+    throw PythonBackendException(
+        "StringLookupTable.lookup() requires a BYTES/STRING tensor.");
+  }
+  if (!tensor->IsCPU()) {
+    throw PythonBackendException(
+        "StringLookupTable.lookup() requires a CPU tensor.");
+  }
+
+  const uint8_t* data = static_cast<const uint8_t*>(tensor->DataPtr());
+  const size_t size = tensor->ByteSize();
+
+  int64_t n = 1;
+  for (auto d : tensor->Dims()) {
+    n *= d;
+  }
+  py::array_t<int64_t> out(n);
+  int64_t* buf = out.mutable_data();
+
+  size_t offset = 0;
+  int64_t i = 0;
+  while (offset + 4 <= size && i < n) {
+    uint32_t len = *reinterpret_cast<const uint32_t*>(data + offset);
+    offset += 4;
+    if (offset + len > size) {
+      throw PythonBackendException(
+          "Invalid bytes tensor data: string extends beyond buffer");
+    }
+    std::string_view sv(reinterpret_cast<const char*>(data + offset), len);
+    auto it = map_.find(sv);
+    buf[i++] = (it == map_.end()) ? default_value_ : it->second;
+    offset += len;
+  }
+  // Any trailing elements (shouldn't happen for well-formed tensors) default.
+  for (; i < n; i++) {
+    buf[i] = default_value_;
+  }
+  return out;
+}
+#endif  // TRITON_PB_STUB
 }}}  // namespace triton::backend::python

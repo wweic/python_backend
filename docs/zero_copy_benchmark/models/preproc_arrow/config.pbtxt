@@ -1,0 +1,11 @@
+name: "preproc_arrow"
+backend: "python"
+max_batch_size: 0
+input [
+  { name: "features", data_type: TYPE_FP32, dims: [ -1 ] },
+  { name: "cat_ids", data_type: TYPE_STRING, dims: [ -1 ] }
+]
+output [
+  { name: "out", data_type: TYPE_FP32, dims: [ -1 ] }
+]
+instance_group [ { count: 1, kind: KIND_CPU } ]

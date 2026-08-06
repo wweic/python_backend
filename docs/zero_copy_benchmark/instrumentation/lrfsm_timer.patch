@@ -1,0 +1,49 @@
+diff --git a/src/pb_stub.cc b/src/pb_stub.cc
+index 2025f78..2a2f305 100644
+--- a/src/pb_stub.cc
++++ b/src/pb_stub.cc
+@@ -36,6 +36,7 @@
+ #include <boost/thread/thread_time.hpp>
+ #include <cstdlib>
+ #include <iomanip>
++#include <chrono>
+ #include <iostream>
+ #include <memory>
+ #include <regex>
+@@ -665,6 +666,16 @@ Stub::LoadRequestsFromSharedMemory(RequestBatch* request_batch_shm_ptr)
+     return py_request_list;
+   }
+ 
++  // --- OPTIONAL INSTRUMENTATION (docs/zero_copy_benchmark) ---
++  // Times how long it takes to load a request batch from shared memory -- where
++  // the eager shm->NumPy copy / PyBytes deserialization happens in the baseline
++  // and is deferred in the zero-copy build. Single-threaded stub -> plain
++  // statics are safe. Logged every 1000 calls; remove for production.
++  static uint64_t lrfsm_calls = 0;
++  static uint64_t lrfsm_reqs = 0;
++  static double lrfsm_total_us = 0.0;
++  auto _lrfsm_t0 = std::chrono::steady_clock::now();
++
+   bi::managed_external_buffer::handle_t* request_shm_handle =
+       reinterpret_cast<bi::managed_external_buffer::handle_t*>(
+           reinterpret_cast<char*>(request_batch_shm_ptr) +
+@@ -678,6 +689,19 @@ Stub::LoadRequestsFromSharedMemory(RequestBatch* request_batch_shm_ptr)
+     py_request_list.append(infer_request);
+   }
+ 
++  auto _lrfsm_t1 = std::chrono::steady_clock::now();
++  lrfsm_calls++;
++  lrfsm_reqs += batch_size;
++  lrfsm_total_us +=
++      std::chrono::duration<double, std::micro>(_lrfsm_t1 - _lrfsm_t0).count();
++  if (lrfsm_calls % 1000 == 0) {
++    std::cerr << "[LRFSM-TIMING] calls=" << lrfsm_calls
++              << " reqs=" << lrfsm_reqs
++              << " avg_per_call=" << (lrfsm_total_us / lrfsm_calls) << "us"
++              << " avg_per_req=" << (lrfsm_total_us / lrfsm_reqs) << "us"
++              << " (last_batch=" << batch_size << ")" << std::endl;
++  }
++
+   return py_request_list;
+ }
+ 
